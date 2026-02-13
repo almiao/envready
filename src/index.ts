@@ -9,6 +9,9 @@ import { ChatCommand } from "./cli/cmd/chat"
 import { UI } from "./cli/ui"
 import { Log } from "./util/log"
 
+// Initialize file logging immediately
+Log.init()
+
 const cli = yargs(hideBin(process.argv))
   .scriptName("envready")
   .wrap(100)
@@ -18,11 +21,12 @@ const cli = yargs(hideBin(process.argv))
   .alias("version", "v")
   .option("verbose", {
     type: "boolean",
-    describe: "Enable verbose output",
+    describe: "Enable verbose output (debug logs to stderr + log file)",
     default: false,
   })
   .middleware((opts) => {
     if (opts.verbose) Log.setLevel("debug")
+    Log.debug(`Log file: ${Log.logFilePath()}`)
   })
   .usage(UI.logo())
   .command(DetectCommand)
@@ -42,5 +46,7 @@ try {
   } else {
     Log.error(String(err))
   }
+  const logPath = Log.logFilePath()
+  if (logPath) Log.file(`[FATAL] ${err instanceof Error ? err.stack || err.message : String(err)}`)
   process.exit(1)
 }

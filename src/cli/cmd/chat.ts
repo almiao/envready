@@ -17,22 +17,18 @@ export const ChatCommand: CommandModule = {
       array: true,
     }),
   handler: async (argv) => {
-    const apiKey = process.env.OPENAI_API_KEY
-    if (!apiKey) {
-      Log.error("OPENAI_API_KEY environment variable is required")
-      Log.info("Set it with: export OPENAI_API_KEY=sk-...")
-      Log.info("Or create a .env file in the project root")
-      return
-    }
+    Log.stage("Chat:start")
+    const modelConfig = AI.resolve()
+    if (!modelConfig) return
 
-    // Gather system context for the AI
     const systemContext = gatherContext()
-    const agent = new AI(apiKey, systemContext)
+    Log.fileData("chat:systemContext", systemContext)
+    const agent = new AI(modelConfig, systemContext)
 
     const initial = (argv.message as string[] | undefined)?.join(" ")
 
     if (initial) {
-      // Single-shot mode
+      Log.stage("Chat:single", initial)
       const response = await agent.chat(initial)
       console.log()
       console.log(response)
@@ -43,6 +39,7 @@ export const ChatCommand: CommandModule = {
     // Interactive mode
     console.log()
     console.log(chalk.cyan("🤖 envready AI assistant"))
+    console.log(chalk.gray(`   Model: ${modelConfig.provider}/${modelConfig.model}`))
     console.log(chalk.gray("   Ask me anything about installing or configuring software."))
     console.log(chalk.gray('   Type "exit" or Ctrl+C to quit.'))
     console.log()
@@ -90,11 +87,12 @@ function gatherContext(): string {
   const software = Software.detect()
   const env = Env.summary()
 
-  return `Current system information:
+  return `当前系统：
 - OS: ${os.name} ${os.version} (${os.arch})
 - Shell: ${os.shell}
-- Installed software: ${software.map((s) => `${s.name}@${s.version}`).join(", ") || "none detected"}
-- Key env vars: ${Object.entries(env).map(([k, v]) => `${k}=${v}`).join(", ")}
+- 包管理器: ${OS.packageManagers().join(", ") || "无"}
+- 已安装软件: ${software.map((s) => `${s.name}@${s.version}`).join(", ") || "无"}
+- 关键环境变量: ${Object.entries(env).map(([k, v]) => `${k}=${v}`).join(", ")}
 - Shell profile: ${Env.shellProfile()}
 `
 }

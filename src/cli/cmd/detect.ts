@@ -4,6 +4,7 @@ import { OS } from "../../detect/os"
 import { Software } from "../../detect/software"
 import { Env } from "../../detect/env"
 import { UI } from "../ui"
+import { Log } from "../../util/log"
 
 export const DetectCommand: CommandModule = {
   command: "detect",
@@ -15,6 +16,7 @@ export const DetectCommand: CommandModule = {
       default: false,
     }),
   handler: async (argv) => {
+    Log.stage("Detect:start")
     if (argv.json) {
       const result = {
         os: OS.detect(),
@@ -24,12 +26,14 @@ export const DetectCommand: CommandModule = {
         path: Env.analyzePath(),
         shellProfile: Env.shellProfile(),
       }
+      Log.parsed("detect:json", result)
       console.log(JSON.stringify(result, null, 2))
       return
     }
 
     // OS Info
     const os = OS.detect()
+    Log.parsed("detect:os", os)
     UI.header("System Information")
     UI.table([
       ["OS", `${os.name} ${os.version}`],
@@ -51,6 +55,7 @@ export const DetectCommand: CommandModule = {
     // Installed Software
     UI.header("Installed Software")
     const software = Software.detect()
+    Log.parsed("detect:software", software)
     if (software.length === 0) {
       console.log(chalk.yellow("  No common development tools found"))
     } else {

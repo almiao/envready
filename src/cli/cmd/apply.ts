@@ -8,6 +8,7 @@ import { OS } from "../../detect/os"
 import { Log } from "../../util/log"
 import type { Installer } from "../../installer/installer"
 
+
 export const ApplyCommand: CommandModule = {
   command: "apply [file]",
   describe: "Apply an envready configuration file",
@@ -19,8 +20,10 @@ export const ApplyCommand: CommandModule = {
   handler: async (argv) => {
     await ready
 
+    Log.stage("Apply:start")
     const file = argv.file as string | undefined
     const config = file ? Config.parse(file) : Config.load()
+    Log.parsed("apply:config", config)
 
     if (!config) {
       Log.error("No envready config file found")
