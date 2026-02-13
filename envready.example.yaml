@@ -1,0 +1,29 @@
+# envready configuration file
+# Place as envready.yaml in your project root
+
+name: "Full-Stack Development Environment"
+description: "Node.js + Python + Docker development setup"
+
+tools:
+  - name: node
+    version: "20"
+    config:
+      manager: fnm
+
+  - name: python
+    version: "3.12"
+    config:
+      manager: pyenv
+
+  - name: docker
+
+  - name: go
+    version: "latest"
+
+  - name: rust
+    config:
+      toolchain: stable
+
+hooks:
+  post_install:
+    - "echo 'Environment setup complete!'"
