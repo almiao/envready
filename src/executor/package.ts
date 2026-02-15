@@ -133,10 +133,11 @@ export namespace Package {
     const dest = path.join(DOWNLOAD_DIR, fname)
     Log.stage("Package:download", `${url} → ${dest}`)
 
-    // Use curl with progress bar, follow redirects
-    await Shell.exec(
+    // Use curl with progress bar, follow redirects — stream output for live progress
+    console.log(`  ⬇ 正在下载: ${fname}`)
+    await Shell.stream(
       `curl -fSL --progress-bar -o "${dest}" "${url}"`,
-      { timeout: 600_000 }, // 10 min timeout for large files
+      { timeout: 600_000, prefix: "  ", live: true },
     )
 
     if (!fs.existsSync(dest)) {
@@ -202,6 +203,7 @@ export namespace Package {
   export async function install(file: DownloadResult, opts?: InstallOptions): Promise<InstallResult> {
     const format = file.format === "unknown" ? detect(file.filename) : file.format
     Log.stage("Package:install", `format=${format} file=${file.filename}`)
+    console.log(`  📦 安装 ${file.filename} (格式: ${format})`)
 
     const o = opts || {}
 
@@ -249,11 +251,13 @@ export namespace Package {
 
     try {
       // Mount the DMG (no UI, no auto-open)
+      console.log(`  📀 挂载 DMG 镜像...`)
       Log.file(`[dmg] mounting ${filepath} → ${mountPoint}`)
       await Shell.exec(`hdiutil attach "${filepath}" -mountpoint "${mountPoint}" -nobrowse -noverify -noautoopen`, { timeout: 60_000 })
 
       // Look for content inside the mounted volume
       const contents = fs.readdirSync(mountPoint)
+      console.log(`  📂 镜像内容: ${contents.join(", ")}`)
       Log.file(`[dmg] contents: ${contents.join(", ")}`)
 
       // Strategy 1: .app → copy to /Applications
@@ -268,7 +272,8 @@ export namespace Package {
           await Shell.exec(`rm -rf "${appPath}"`)
         }
 
-        await Shell.exec(`cp -R "${path.join(mountPoint, app)}" "${target}/"`)
+        console.log(`  📁 复制 ${app} → ${target}/`)
+        await Shell.stream(`cp -R "${path.join(mountPoint, app)}" "${target}/"`, { prefix: "  ", timeout: 120_000 })
         Log.file(`[dmg] installed ${app} → ${target}`)
 
         return { ok: true, message: `已安装 ${app} → ${target}`, installed_path: appPath }
@@ -277,6 +282,7 @@ export namespace Package {
       // Strategy 2: .pkg inside DMG → delegate to pkg installer
       const pkg = contents.find((f) => f.endsWith(".pkg") || f.endsWith(".mpkg"))
       if (pkg) {
+        console.log(`  📦 发现安装包: ${pkg}`)
         const pkgPath = path.join(mountPoint, pkg)
         return installPkg(pkgPath, opts)
       }
@@ -298,6 +304,7 @@ export namespace Package {
       return { ok: false, message: `DMG 中未找到可安装的 .app/.pkg 文件，内容: ${contents.join(", ")}` }
     } finally {
       // Always unmount
+      console.log(`  💿 卸载 DMG 镜像...`)
       try {
         await Shell.exec(`hdiutil detach "${mountPoint}" -force 2>/dev/null || true`, { timeout: 15_000 })
       } catch {}
@@ -310,10 +317,19 @@ export namespace Package {
 
   async function installPkg(filepath: string, opts: InstallOptions): Promise<InstallResult> {
     const target = opts.target || "/"
-    const sudo = opts.sudo !== false ? "sudo " : ""
+    const needSudo = opts.sudo !== false && target === "/"
 
     Log.file(`[pkg] installing ${filepath} → ${target}`)
-    await Shell.exec(`${sudo}installer -pkg "${filepath}" -target "${target}"`, { timeout: 300_000 })
+
+    if (needSudo) {
+      console.log(`  🔑 需要管理员权限安装 ${path.basename(filepath)}`)
+      console.log(`  🔧 执行: sudo installer -pkg ... -target ${target}`)
+      // Use Shell.stream with inherited stdin so user can type sudo password
+      await Shell.stream(`sudo installer -pkg "${filepath}" -target "${target}"`, { prefix: "  ", timeout: 300_000 })
+    } else {
+      console.log(`  🔧 执行 installer: ${path.basename(filepath)}`)
+      await Shell.stream(`installer -pkg "${filepath}" -target "${target}"`, { prefix: "  ", timeout: 300_000 })
+    }
 
     return { ok: true, message: `已安装 ${path.basename(filepath)}` }
   }
@@ -377,7 +393,8 @@ export namespace Package {
     const flag = format === "tar.bz2" ? "j" : format === "tar.xz" ? "J" : "z"
 
     Log.file(`[tar] extracting ${filepath} → ${target}`)
-    await Shell.exec(`${sudo}tar -x${flag}f "${filepath}" -C "${target}"`, { timeout: 120_000 })
+    console.log(`  📦 解压 ${path.basename(filepath)} → ${target}`)
+    await Shell.stream(`${sudo}tar -x${flag}f "${filepath}" -C "${target}"`, { prefix: "  ", timeout: 120_000 })
 
     return { ok: true, message: `已解压到 ${target}`, installed_path: target }
   }
@@ -388,9 +405,9 @@ export namespace Package {
 
   async function installDeb(filepath: string, _opts: InstallOptions): Promise<InstallResult> {
     Log.file(`[deb] installing ${filepath}`)
-    // dpkg install + fix dependencies
-    await Shell.exec(`sudo dpkg -i "${filepath}"`, { timeout: 120_000 })
-    await Shell.exec(`sudo apt-get install -f -y`, { timeout: 120_000 })
+    console.log(`  📦 安装 ${path.basename(filepath)}...`)
+    await Shell.stream(`sudo dpkg -i "${filepath}"`, { prefix: "  ", timeout: 120_000 })
+    await Shell.stream(`sudo apt-get install -f -y`, { prefix: "  ", timeout: 120_000 })
 
     return { ok: true, message: `已安装 ${path.basename(filepath)}` }
   }
@@ -402,12 +419,12 @@ export namespace Package {
   async function installRpm(filepath: string, _opts: InstallOptions): Promise<InstallResult> {
     Log.file(`[rpm] installing ${filepath}`)
 
-    // Prefer dnf, fallback to rpm
+    console.log(`  📦 安装 ${path.basename(filepath)}...`)
     const hasDnf = await Shell.has("dnf")
     if (hasDnf) {
-      await Shell.exec(`sudo dnf install -y "${filepath}"`, { timeout: 120_000 })
+      await Shell.stream(`sudo dnf install -y "${filepath}"`, { prefix: "  ", timeout: 120_000 })
     } else {
-      await Shell.exec(`sudo rpm -i "${filepath}"`, { timeout: 120_000 })
+      await Shell.stream(`sudo rpm -i "${filepath}"`, { prefix: "  ", timeout: 120_000 })
     }
 
     return { ok: true, message: `已安装 ${path.basename(filepath)}` }
@@ -438,7 +455,8 @@ export namespace Package {
   async function installExe(filepath: string, opts: InstallOptions): Promise<InstallResult> {
     const silent = opts.silent !== false ? " /S /SILENT /VERYSILENT /NORESTART" : ""
     Log.file(`[exe] installing ${filepath}${silent}`)
-    await Shell.exec(`"${filepath}"${silent}`, { timeout: 600_000 })
+    console.log(`  📦 安装 ${path.basename(filepath)}...`)
+    await Shell.stream(`"${filepath}"${silent}`, { prefix: "  ", timeout: 600_000 })
 
     return { ok: true, message: `已安装 ${path.basename(filepath)}` }
   }
@@ -450,7 +468,8 @@ export namespace Package {
   async function installMsi(filepath: string, opts: InstallOptions): Promise<InstallResult> {
     const silent = opts.silent !== false ? " /qn /norestart" : ""
     Log.file(`[msi] installing ${filepath}${silent}`)
-    await Shell.exec(`msiexec /i "${filepath}"${silent}`, { timeout: 600_000 })
+    console.log(`  📦 安装 ${path.basename(filepath)}...`)
+    await Shell.stream(`msiexec /i "${filepath}"${silent}`, { prefix: "  ", timeout: 600_000 })
 
     return { ok: true, message: `已安装 ${path.basename(filepath)}` }
   }
@@ -461,7 +480,8 @@ export namespace Package {
 
   async function installSnap(filepath: string, _opts: InstallOptions): Promise<InstallResult> {
     Log.file(`[snap] installing ${filepath}`)
-    await Shell.exec(`sudo snap install "${filepath}" --dangerous`, { timeout: 120_000 })
+    console.log(`  📦 安装 ${path.basename(filepath)}...`)
+    await Shell.stream(`sudo snap install "${filepath}" --dangerous`, { prefix: "  ", timeout: 120_000 })
     return { ok: true, message: `已安装 ${path.basename(filepath)}` }
   }
 
@@ -471,7 +491,8 @@ export namespace Package {
 
   async function installFlatpak(filepath: string, _opts: InstallOptions): Promise<InstallResult> {
     Log.file(`[flatpak] installing ${filepath}`)
-    await Shell.exec(`flatpak install -y "${filepath}"`, { timeout: 120_000 })
+    console.log(`  📦 安装 ${path.basename(filepath)}...`)
+    await Shell.stream(`flatpak install -y "${filepath}"`, { prefix: "  ", timeout: 120_000 })
     return { ok: true, message: `已安装 ${path.basename(filepath)}` }
   }
 
