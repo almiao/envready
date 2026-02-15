@@ -11,16 +11,33 @@ import { Log } from "../../util/log"
 import { AI } from "../../ai/agent"
 import type { Installer } from "../../installer/installer"
 
-/** Global abort controller — Ctrl+C triggers this to kill running child processes */
-const abortController = new AbortController()
+/**
+ * Per-tool abort controller. Each tool install gets a fresh one so
+ * Ctrl+C only kills the current tool, not all subsequent ones.
+ * Double Ctrl+C exits the whole process.
+ */
+let abortController = new AbortController()
+let ctrlCCount = 0
 
 process.on("SIGINT", () => {
-  console.log()
-  console.log(chalk.yellow("\n⚠ 中断信号 (Ctrl+C) — 正在停止..."))
+  ctrlCCount++
+  if (ctrlCCount >= 2) {
+    console.log(chalk.red("\n⚠ 强制退出"))
+    process.exit(130)
+  }
+  console.log(chalk.yellow("\n⚠ 中断当前安装 (再按一次 Ctrl+C 退出全部)"))
   abortController.abort()
-  // Give child processes 3s to clean up, then force exit
-  setTimeout(() => process.exit(130), 3000)
+  // Give child processes 3s to clean up
+  setTimeout(() => {
+    if (ctrlCCount < 2) ctrlCCount = 0 // reset after cooldown
+  }, 3000)
 })
+
+/** Reset abort controller for next tool */
+function resetAbort() {
+  abortController = new AbortController()
+  ctrlCCount = 0
+}
 
 function createContext(): Installer.Context {
   const os = OS.detect()
@@ -45,27 +62,6 @@ function createContext(): Installer.Context {
   }
 }
 
-/**
- * Execute a command with real-time streaming output.
- * Shows live progress to the user (download bars, build output, etc.)
- * Returns captured stdout for further processing.
- */
-async function streamExec(cmd: string, opts?: { prefix?: string; timeout?: number }): Promise<string> {
-  Log.exec(cmd)
-  try {
-    const result = await Shell.stream(cmd, {
-      prefix: opts?.prefix || "  ",
-      timeout: opts?.timeout || 600_000,
-      signal: abortController.signal,
-    })
-    Log.exec(cmd, { ok: true, output: result.stdout.slice(0, 500) })
-    return result.stdout
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    Log.exec(cmd, { ok: false, error: msg })
-    throw err
-  }
-}
 
 function prompt(question: string): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stdout })
@@ -121,6 +117,8 @@ interface MethodOption {
   download_url?: string
   /** Commands for this method */
   commands: string[]
+  /** Env setup commands specific to this method (overrides tool-level if present) */
+  env_setup_commands?: string[]
   /** Pros of this method */
   pros: string
   /** Cons of this method (optional) */
@@ -295,7 +293,7 @@ export const InstallCommand: CommandModule = {
             continue
           }
 
-          // Convert to ToolPlan
+          // Convert to ToolPlan — option-level env_setup overrides tool-level
           const isPackageInstall = selected.method === "package_install" && selected.download_url
           const manual = selected.method === "open_url" && !isPackageInstall
           plan.push({
@@ -308,7 +306,7 @@ export const InstallCommand: CommandModule = {
             download_url: selected.download_url,
             commands: selected.commands,
             verify_command: tool.verify_command,
-            env_setup_commands: tool.env_setup_commands,
+            env_setup_commands: selected.env_setup_commands || tool.env_setup_commands,
             manual_action: manual,
             manual_instruction: manual ? `请打开浏览器手动下载并安装 ${tool.name}` : undefined,
             depends_on: tool.depends_on,
@@ -394,6 +392,8 @@ export const InstallCommand: CommandModule = {
     const installed = new Set<string>()
 
     for (const tool of plan) {
+      resetAbort() // Fresh abort controller per tool
+
       // Check dependencies
       for (const dep of tool.depends_on) {
         if (!installed.has(dep)) {
@@ -458,11 +458,11 @@ export const InstallCommand: CommandModule = {
           continue
         }
 
-        // Verify (for manual installs)
+        // Verify (for manual installs) — login shell so freshly installed tools are found
         if (tool.verify_command) {
           const verifySpinner = ora("验证安装...").start()
           try {
-            const out = await ctx.exec(tool.verify_command)
+            const out = await Shell.exec(tool.verify_command, { login: true, timeout: 15_000 })
             verifySpinner.succeed(`已安装: ${out.trim().slice(0, 80)}`)
             installed.add(tool.name)
           } catch {
@@ -502,24 +502,18 @@ export const InstallCommand: CommandModule = {
             console.log()
             console.log(chalk.green(`  ✔ ${tool.name}: ${result.message}`))
 
-            // Verify
+            // Env setup first, then verify in login shell
+            if (tool.env_setup_commands.length > 0) {
+              console.log(chalk.yellow("  配置环境变量..."))
+              await Shell.session(tool.env_setup_commands, { prefix: "    " })
+            }
             if (tool.verify_command) {
               try {
-                const out = await ctx.exec(tool.verify_command)
+                const out = await Shell.exec(tool.verify_command, { login: true, timeout: 15_000 })
                 console.log(chalk.green(`  ✔ 已验证: ${out.trim().slice(0, 80)}`))
               } catch {
                 console.log(chalk.yellow("  ⚠ 验证失败，可能需要重启 shell"))
               }
-            }
-
-            // Env setup
-            if (tool.env_setup_commands.length > 0) {
-              console.log(chalk.yellow("  配置环境变量..."))
-              for (const cmd of tool.env_setup_commands) {
-                console.log(chalk.gray(`    $ ${cmd}`))
-                try { await ctx.exec(cmd) } catch { Log.warn(`环境配置命令失败: ${cmd}`) }
-              }
-              console.log(chalk.gray("  提示：重启 shell 使环境变量生效，或执行 source ~/.zshrc"))
             }
 
             installed.add(tool.name)
@@ -528,7 +522,7 @@ export const InstallCommand: CommandModule = {
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
-          console.log(chalk.red(`\n  ✖ ${tool.name} 包安装失败: ${msg}`))
+          console.log(chalk.red(`\n  ✖ ${tool.name} 包安装失败`))
           Log.file(`[INSTALL:PKG_ERROR] ${tool.name}: ${msg}`)
 
           const recovered = await errorRecoveryLoop(agent, tool, msg, ctx)
@@ -554,48 +548,63 @@ export const InstallCommand: CommandModule = {
         continue
       }
 
-      // Execute commands (with live streaming output)
+      // Execute all commands in a single shell session (env changes persist between commands)
       console.log(chalk.gray(`  正在安装 ${tool.name}... (Ctrl+C 中断)`))
-      console.log()
       let success = true
       try {
-        for (const cmd of tool.commands) {
-          console.log(chalk.dim(`  $ ${cmd}`))
-          await streamExec(cmd, { prefix: "  " })
-        }
+        // Show elapsed timer until first output arrives
+        let gotOutput = false
+        const start = Date.now()
+        const ticker = setInterval(() => {
+          if (!gotOutput) {
+            const s = Math.round((Date.now() - start) / 1000)
+            process.stderr.write(`\r  ${chalk.dim(`⏳ 等待响应... (${s}s)`)}`)
+          }
+        }, 1000)
+
+        await Shell.session(tool.commands, {
+          prefix: "  ",
+          timeout: 600_000,
+          stallTimeout: STALL_TIMEOUT,
+          onStall: createStallHandler(agent, tool.name),
+          signal: abortController.signal,
+          onLine: () => {
+            if (!gotOutput) {
+              gotOutput = true
+              clearInterval(ticker)
+              process.stderr.write("\r" + " ".repeat(40) + "\r") // clear timer line
+            }
+          },
+        })
+        clearInterval(ticker)
         console.log()
         console.log(chalk.green(`  ✔ ${tool.name} 安装完成`))
 
-        // Verify
+        // Execute env setup commands (before verify, so profile has the config)
+        if (tool.env_setup_commands.length > 0) {
+          console.log(chalk.yellow("  配置环境变量..."))
+          await Shell.session(tool.env_setup_commands, { prefix: "    " })
+          console.log(chalk.gray("  提示：重启 shell 使环境变量生效，或执行 source ~/.zshrc"))
+        }
+
+        // Verify in a login shell so freshly-written .zshrc/.bash_profile are loaded
+        // This way sdkman/nvm/pyenv tools installed above are discoverable
         if (tool.verify_command) {
           try {
-            const out = await ctx.exec(tool.verify_command)
+            const out = await Shell.exec(tool.verify_command, { login: true, timeout: 15_000 })
             console.log(chalk.green(`  ✔ 已验证: ${out.trim().slice(0, 80)}`))
           } catch {
             console.log(chalk.yellow("  ⚠ 验证失败，可能需要重启 shell 或手动检查"))
             success = false
           }
         }
-
-        // Execute env setup commands
-        if (tool.env_setup_commands.length > 0) {
-          console.log(chalk.yellow("  配置环境变量..."))
-          for (const cmd of tool.env_setup_commands) {
-            console.log(chalk.gray(`    $ ${cmd}`))
-            try {
-              await ctx.exec(cmd)
-            } catch (err) {
-              Log.warn(`环境配置命令失败: ${cmd}`)
-            }
-          }
-          console.log(chalk.gray("  提示：重启 shell 使环境变量生效，或执行 source ~/.zshrc"))
-        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
+        const isStall = err instanceof Shell.StallError
         Log.file(`[INSTALL:EXEC_ERROR] ${tool.name}: ${msg}`)
-        console.log(chalk.red(`\n  ✖ ${tool.name} 安装失败: ${msg}`))
+        console.log(chalk.red(`\n  ✖ ${tool.name} ${isStall ? "安装超时无响应" : "安装失败"}`))
 
-        // ── Error recovery loop ──
+        // ── Autonomous error recovery loop ──
         const recovered = await errorRecoveryLoop(agent, tool, msg, ctx)
         if (recovered) {
           installed.add(tool.name)
@@ -747,6 +756,7 @@ async function analyzeIntent(agent: AI, input: string, versionHint?: string): Pr
           "label": "OpenJDK (推荐)",
           "method": "brew",
           "commands": ["brew install openjdk@22"],
+          "env_setup_commands": ["echo 'export JAVA_HOME=\"$(brew --prefix openjdk@22)\"' >> ~/.zshrc", "echo 'export PATH=\"$JAVA_HOME/bin:$PATH\"' >> ~/.zshrc"],
           "pros": "开源免费，系统集成好",
           "cons": "仅包含 JRE，需手动配 JAVA_HOME"
         },
@@ -754,12 +764,13 @@ async function analyzeIntent(agent: AI, input: string, versionHint?: string): Pr
           "label": "Oracle JDK",
           "method": "open_url",
           "commands": [],
+          "env_setup_commands": [],
           "pros": "Oracle 官方支持，包含 JMC 等工具",
           "cons": "需要注册 Oracle 账号下载"
         }
       ],
       "verify_command": "java --version",
-      "env_setup_commands": ["echo 'export JAVA_HOME=\"$(brew --prefix openjdk@22)\"' >> ~/.zshrc", "echo 'export PATH=\"$JAVA_HOME/bin:$PATH\"' >> ~/.zshrc"],
+      "env_setup_commands": [],
       "depends_on": []
     }
   ]
@@ -835,6 +846,7 @@ manual_instruction 要写清楚每一步操作（编号列表），例如：
 对这类软件，使用 \`tools_with_options\` 数组，每个 option 包含：
 - label: 方案名称（如"Homebrew (推荐)"）
 - method + commands
+- env_setup_commands（**每个方案独立的环境配置**，不同方案路径不同！）
 - pros / cons
 
 用户会看到方案列表并交互选择（程序自动提示）。
@@ -1009,23 +1021,101 @@ tools 数组按依赖关系排序（被依赖的在前），确保依次安装�
 // ══════════════════════════════════════════════════════
 
 interface FixAction {
-  action: "commands" | "alternative" | "info"
-  /** Shell commands to run (for action=commands) */
-  commands?: string[]
-  /** Explanation of what these commands do */
+  action: "commands" | "alternative" | "skip"
+  /** Explanation of the diagnosis and what will be done */
   explanation: string
+  /** Shell commands to fix the issue (for action=commands) */
+  commands?: string[]
+  /** Whether to retry original commands after fix (for action=commands) */
+  retry?: boolean
   /** Alternative install plan (for action=alternative) */
   alternative?: {
     method: string
     commands: string[]
     download_url?: string
   }
-  /** Additional info to show user (for action=info) */
-  info?: string
 }
 
-const MAX_FIX_ATTEMPTS = 3
+const MAX_AUTO_ATTEMPTS = 3
+/** Stall check interval: 10s without output → ask AI to decide wait/kill */
+const STALL_TIMEOUT = 10_000
 
+/**
+ * Create an AI-driven stall handler.
+ *
+ * When a process produces no output for STALL_TIMEOUT ms, instead of blindly
+ * killing it, we ask the AI: "The process has no output for 2 min. Here's the
+ * command and last output. Should we keep waiting or kill it?"
+ *
+ * Examples of AI reasoning:
+ * - `brew install gcc` last output "==> Compiling..." 3 min ago → wait (compiling is slow)
+ * - `curl -o file.dmg https://...` progress stuck at 0% for 2 min → kill (network issue)
+ * - `npm install` no output 5 min → kill (likely hung)
+ */
+function createStallHandler(agent: AI, toolName: string): (info: Shell.StallInfo) => Promise<"wait" | "kill"> {
+  return async (info) => {
+    Log.file(`[STALL] ${toolName}: stallCount=${info.stallCount} elapsed=${Math.round(info.elapsed / 1000)}s`)
+    console.log(chalk.yellow(`\n  ⏳ ${toolName}: ${Math.round(info.elapsed / 1000)}s 无输出 (第 ${info.stallCount} 次检测)`))
+    console.log(chalk.gray(`  AI 正在判断是否需要中断...`))
+
+    try {
+      const response = await agent.chat(`## 进程无响应判断
+
+安装命令已经 ${Math.round(info.elapsed / 1000)} 秒没有任何输出。已检测 ${info.stallCount} 次（每 ${Math.round(STALL_TIMEOUT / 1000)}s 检测一次）。
+
+命令: ${info.cmd.slice(0, 200)}
+最后输出: ${info.lastOutput || "(无)"}
+
+回复 WAIT 或 KILL：
+- WAIT: 编译/构建、brew install 解压/编译、大文件下载波动、总时间 <5min 的等场景
+- KILL: 进度完全卡住、简单命令超时、已等待超过 5 分钟且非编译场景、输出是错误信息后就没了
+
+只回复一个词。`)
+
+      const decision = response.trim().toUpperCase().includes("WAIT") ? "wait" : "kill" as const
+      Log.file(`[STALL:DECISION] ${toolName}: ${decision}`)
+
+      if (decision === "wait") {
+        console.log(chalk.green(`  ✔ AI 判断: 继续等待（可能在编译/解压中）`))
+      } else {
+        console.log(chalk.red(`  ✖ AI 判断: 进程可能卡死，中断执行`))
+      }
+
+      return decision
+    } catch {
+      // AI failed, use simple heuristic: first stall → wait, subsequent → kill
+      const decision = info.stallCount <= 1 ? "wait" : "kill" as const
+      console.log(chalk.yellow(`  ⚠ AI 判断失败，${decision === "wait" ? "继续等待" : "中断执行"}`))
+      return decision
+    }
+  }
+}
+
+/**
+ * Clean up raw error messages for display.
+ * Removes internal session script noise (set -e, echo lines).
+ */
+function cleanError(raw: string): string {
+  return raw
+    .replace(/set -e\n/g, "")
+    .replace(/echo '.*?'\n/g, "")
+    .replace(/Command failed \(exit \d+\): set -e\n[\s\S]*?\n(?=[A-Z=])/g, "")
+    .trim()
+    .slice(0, 300)
+}
+
+/**
+ * Autonomous error recovery loop — AI decides what to do.
+ *
+ * Flow:
+ * 1. Error occurs → AI analyzes error + context → decides: fix / alternative / skip
+ * 2. If fix: execute fix commands → retry original install
+ * 3. If alternative: execute alternative commands
+ * 4. If skip or exhausted: give up
+ *
+ * User can always Ctrl+C to abort the entire process.
+ * No r/a/m/s menu — AI makes the call.
+ */
 async function errorRecoveryLoop(
   agent: AI,
   tool: ToolPlan,
@@ -1034,182 +1124,164 @@ async function errorRecoveryLoop(
 ): Promise<boolean> {
   Log.stage("Install:error-recovery", `tool=${tool.name}`)
 
-  for (let attempt = 1; attempt <= MAX_FIX_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= MAX_AUTO_ATTEMPTS; attempt++) {
+    const displayError = cleanError(error)
     console.log()
-    console.log(chalk.red(`  ✖ ${tool.name} 安装失败 (尝试 ${attempt}/${MAX_FIX_ATTEMPTS})`))
-    console.log(chalk.gray(`  错误: ${error.slice(0, 200)}`))
-    console.log()
-    console.log(chalk.bold("  选择操作："))
-    console.log(`    ${chalk.cyan("r")} — 让 AI 分析错误并自动修复`)
-    console.log(`    ${chalk.cyan("a")} — 让 AI 推荐替代安装方案`)
-    console.log(`    ${chalk.cyan("m")} — 我手动修复，修完后继续验证`)
-    console.log(`    ${chalk.cyan("s")} — 跳过此软件`)
-    console.log()
+    console.log(chalk.red(`  ✖ ${tool.name} 安装失败 (${attempt}/${MAX_AUTO_ATTEMPTS})`))
+    console.log(chalk.gray(`  错误: ${displayError}`))
+    console.log(chalk.gray(`  AI 正在自动分析并尝试修复... (Ctrl+C 跳过)`))
 
-    const choice = await prompt(chalk.cyan("  选择 (r/a/m/s) > "))
-    Log.file(`[RECOVERY] tool=${tool.name} attempt=${attempt} choice="${choice}"`)
-
-    if (choice.toLowerCase() === "s") {
-      Log.info(`已跳过 ${tool.name}`)
+    // AI autonomously decides what to do
+    let fix: FixAction
+    try {
+      fix = await askAIForFix(agent, tool, error, attempt)
+      Log.parsed(`recovery:fix(attempt=${attempt})`, fix)
+    } catch (aiErr) {
+      Log.file(`[RECOVERY:AI_ERROR] ${aiErr instanceof Error ? aiErr.message : String(aiErr)}`)
+      console.log(chalk.yellow(`  ⚠ AI 分析失败，跳过 ${tool.name}`))
       return false
     }
 
-    if (choice.toLowerCase() === "m") {
-      // User fixes manually, then we verify
-      const done = await prompt(chalk.cyan("  手动修复完成后按回车继续 > "))
-      if (tool.verify_command) {
-        const spinner = ora("验证安装...").start()
-        try {
-          const out = await ctx.exec(tool.verify_command)
-          spinner.succeed(`已安装: ${out.trim().slice(0, 80)}`)
-          return true
-        } catch {
-          spinner.warn("验证失败")
-          error = "手动修复后验证仍然失败"
-          continue
-        }
-      }
-      return true // No verify command, trust user
+    // AI says skip — respect it
+    if (fix.action === "skip") {
+      console.log()
+      console.log(chalk.yellow(`  ⏭ AI 判断无法自动修复: ${fix.explanation}`))
+      return false
     }
 
-    // AI-driven fix (r or a)
-    const mode = choice.toLowerCase() === "a" ? "alternative" : "fix"
-    const spinner = ora("AI 正在分析错误...").start()
+    // AI proposes an alternative approach
+    if (fix.action === "alternative" && fix.alternative) {
+      console.log()
+      console.log(chalk.yellow(`  🔄 [${attempt}/${MAX_AUTO_ATTEMPTS}] 切换安装方案: ${fix.explanation}`))
 
-    try {
-      const fix = await askAIForFix(agent, tool, error, mode)
-      spinner.stop()
-      Log.parsed(`recovery:fix(attempt=${attempt})`, fix)
+      try {
+        // If alternative has a download_url, use Package.fromUrl for proper dmg/pkg handling
+        if (fix.alternative.download_url && fix.alternative.method === "package_install") {
+          console.log(chalk.dim(`     ⬇ ${fix.alternative.download_url}`))
+          console.log()
+          const result = await Package.fromUrl(fix.alternative.download_url, { name: tool.name })
+          if (!result.ok) throw new Error(result.message)
+        } else {
+          for (const cmd of fix.alternative.commands) {
+            console.log(chalk.dim(`     $ ${cmd}`))
+          }
+          console.log()
+          await Shell.session(fix.alternative.commands, {
+            prefix: "  ",
+            timeout: 600_000,
+            stallTimeout: STALL_TIMEOUT,
+            onStall: createStallHandler(agent, tool.name),
+            signal: abortController.signal,
+          })
+        }
+        console.log(chalk.green(`\n  ✔ ${tool.name} 替代方案执行成功`))
 
-      if (fix.action === "info") {
-        // AI provides diagnostic info only
-        console.log()
-        console.log(chalk.yellow("  💡 AI 诊断："))
-        console.log(chalk.white(`     ${fix.explanation}`))
-        if (fix.info) console.log(chalk.gray(`     ${fix.info}`))
+        // Verify in login shell
+        if (tool.verify_command) {
+          try {
+            const out = await Shell.exec(tool.verify_command, { login: true, timeout: 15_000 })
+            console.log(chalk.green(`  ✔ 已验证: ${out.trim().slice(0, 80)}`))
+          } catch {
+            console.log(chalk.yellow("  ⚠ 验证失败，可能需要重启 shell"))
+          }
+        }
+        return true
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        const isStall = err instanceof Shell.StallError
+        console.log(chalk.red(`\n  ✖ 替代方案${isStall ? "超时无响应" : "失败"}: ${cleanError(msg)}`))
+        error = `替代方案 (${fix.alternative.method}) 失败: ${msg}`
+        continue
+      }
+    }
+
+    // AI proposes fix commands (and optionally retry)
+    if (fix.action === "commands" && fix.commands && fix.commands.length > 0) {
+      console.log()
+      console.log(chalk.yellow(`  🔧 [${attempt}/${MAX_AUTO_ATTEMPTS}] ${fix.explanation}`))
+      for (const cmd of fix.commands) {
+        console.log(chalk.dim(`     $ ${cmd}`))
+      }
+      console.log()
+
+      try {
+        await Shell.session(fix.commands, {
+          prefix: "  ",
+          timeout: 600_000,
+          stallTimeout: STALL_TIMEOUT,
+          onStall: createStallHandler(agent, tool.name),
+          signal: abortController.signal,
+        })
+        console.log(chalk.green(`  ✔ 修复命令执行成功`))
+      } catch (fixErr) {
+        const msg = fixErr instanceof Error ? fixErr.message : String(fixErr)
+        console.log(chalk.red(`\n  ✖ 修复命令失败: ${cleanError(msg)}`))
+        error = `修复命令失败: ${msg}`
         continue
       }
 
-      if (fix.action === "alternative" && fix.alternative) {
-        // AI suggests an entirely different approach
-        console.log()
-        console.log(chalk.yellow(`  🔄 AI 建议替代方案：`))
-        console.log(chalk.white(`     ${fix.explanation}`))
-        console.log(chalk.gray(`     方法: ${fix.alternative.method}`))
-        for (const cmd of fix.alternative.commands) {
-          console.log(chalk.dim(`     $ ${cmd}`))
-        }
-        console.log()
-
-        const accept = await prompt(chalk.cyan("  执行替代方案？(Y/n) > "))
-        if (accept.toLowerCase() === "n") continue
-
-        // Execute alternative (with live output)
-        console.log(chalk.gray(`\n  执行替代方案... (Ctrl+C 中断)\n`))
+      // Retry original install if AI says so (default: true)
+      if (fix.retry !== false) {
+        console.log(chalk.gray(`\n  重新安装 ${tool.name}...\n`))
         try {
-          for (const cmd of fix.alternative.commands) {
-            console.log(chalk.dim(`  $ ${cmd}`))
-            await streamExec(cmd, { prefix: "  " })
-          }
-          console.log(chalk.green(`\n  ✔ ${tool.name} 替代方案执行成功`))
+          await Shell.session(tool.commands, {
+            prefix: "  ",
+            timeout: 600_000,
+            stallTimeout: STALL_TIMEOUT,
+            onStall: createStallHandler(agent, tool.name),
+            signal: abortController.signal,
+          })
+          console.log(chalk.green(`\n  ✔ ${tool.name} 安装成功`))
 
-          // Verify
           if (tool.verify_command) {
             try {
-              const out = await ctx.exec(tool.verify_command)
+              const out = await Shell.exec(tool.verify_command, { login: true, timeout: 15_000 })
               console.log(chalk.green(`  ✔ 已验证: ${out.trim().slice(0, 80)}`))
-              return true
             } catch {
-              console.log(chalk.yellow("  ⚠ 验证失败"))
-              error = "替代方案执行后验证仍然失败"
-              continue
+              console.log(chalk.yellow("  ⚠ 验证失败，但安装命令已成功"))
             }
           }
           return true
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          console.log(chalk.red(`\n  ✖ 替代方案也失败: ${msg}`))
-          error = `替代方案 (${fix.alternative.method}) 也失败: ${msg}`
+        } catch (retryErr) {
+          const msg = retryErr instanceof Error ? retryErr.message : String(retryErr)
+          console.log(chalk.red(`\n  ✖ 重试失败: ${cleanError(msg)}`))
+          error = `修复后重试失败: ${msg}`
           continue
         }
       }
 
-      if (fix.action === "commands" && fix.commands && fix.commands.length > 0) {
-        // AI provides fix commands
-        console.log()
-        console.log(chalk.yellow(`  🔧 AI 修复方案：`))
-        console.log(chalk.white(`     ${fix.explanation}`))
-        for (const cmd of fix.commands) {
-          console.log(chalk.dim(`     $ ${cmd}`))
-        }
-        console.log()
-
-        const accept = await prompt(chalk.cyan("  执行修复命令？(Y/n) > "))
-        if (accept.toLowerCase() === "n") continue
-
-        // Execute fix commands (with live output)
-        console.log(chalk.gray(`\n  执行修复... (Ctrl+C 中断)\n`))
+      // fix.retry === false means fix commands alone should be enough (e.g. pip install xxx)
+      if (tool.verify_command) {
         try {
-          for (const cmd of fix.commands) {
-            console.log(chalk.dim(`  $ ${cmd}`))
-            await streamExec(cmd, { prefix: "  " })
-          }
-          console.log(chalk.green(`  ✔ 修复命令执行成功`))
-
-          // Now retry the original install
-          console.log(chalk.gray(`\n  重新安装 ${tool.name}...\n`))
-          try {
-            for (const cmd of tool.commands) {
-              console.log(chalk.dim(`  $ ${cmd}`))
-              await streamExec(cmd, { prefix: "  " })
-            }
-            console.log(chalk.green(`\n  ✔ ${tool.name} 安装成功`))
-
-            // Verify
-            if (tool.verify_command) {
-              try {
-                const out = await ctx.exec(tool.verify_command)
-                console.log(chalk.green(`  ✔ 已验证: ${out.trim().slice(0, 80)}`))
-                return true
-              } catch {
-                console.log(chalk.yellow("  ⚠ 验证失败，但安装命令已成功"))
-                return true
-              }
-            }
-            return true
-          } catch (retryErr) {
-            const msg = retryErr instanceof Error ? retryErr.message : String(retryErr)
-            console.log(chalk.red(`\n  ✖ 重试仍然失败: ${msg}`))
-            error = `修复后重试仍失败: ${msg}`
-            continue
-          }
-        } catch (fixErr) {
-          const msg = fixErr instanceof Error ? fixErr.message : String(fixErr)
-          console.log(chalk.red(`\n  ✖ 修复命令执行失败: ${msg}`))
-          error = `修复命令自身失败: ${msg}`
+          const out = await Shell.exec(tool.verify_command, { login: true, timeout: 15_000 })
+          console.log(chalk.green(`  ✔ 已验证: ${out.trim().slice(0, 80)}`))
+          return true
+        } catch {
+          error = "修复后验证仍失败"
           continue
         }
       }
-    } catch (aiErr) {
-      spinner.fail("AI 分析失败")
-      Log.file(`[RECOVERY:AI_ERROR] ${aiErr instanceof Error ? aiErr.message : String(aiErr)}`)
-      continue
+      return true
     }
   }
 
-  console.log(chalk.red(`  ✖ ${tool.name} 经过 ${MAX_FIX_ATTEMPTS} 次尝试仍未成功`))
-  Log.file(`[RECOVERY:EXHAUSTED] ${tool.name} after ${MAX_FIX_ATTEMPTS} attempts`)
+  console.log(chalk.red(`  ✖ ${tool.name} 经过 ${MAX_AUTO_ATTEMPTS} 次自动修复尝试仍未成功`))
+  Log.file(`[RECOVERY:EXHAUSTED] ${tool.name} after ${MAX_AUTO_ATTEMPTS} attempts`)
   return false
 }
 
-async function askAIForFix(agent: AI, tool: ToolPlan, error: string, mode: "fix" | "alternative"): Promise<FixAction> {
+/**
+ * Ask AI to analyze an error and autonomously decide the best recovery action.
+ *
+ * The AI sees the full context (error, OS, history) and decides:
+ * - "commands": run fix commands, then retry original install
+ * - "alternative": abandon original method, try a completely different approach
+ * - "skip": this can't be auto-fixed (e.g. requires license acceptance, GUI, etc.)
+ */
+async function askAIForFix(agent: AI, tool: ToolPlan, error: string, attempt: number): Promise<FixAction> {
   const osInfo = OS.detect()
 
-  const modeInstruction = mode === "fix"
-    ? `分析错误原因，给出**修复命令**（action="commands"）。修复命令应该解决根本问题（如安装依赖、修复权限、更新 brew 等），然后用户会重新执行原始安装命令。`
-    : `提供一个**完全不同的安装方式**（action="alternative"），例如从命令行换成直接下载安装包，或换一个包管理器。`
-
-  const p = `## 安装错误修复
+  const p = `## 安装错误自动诊断
 
 ### 软件
 - 名称: ${tool.name}@${tool.version}
@@ -1219,49 +1291,56 @@ async function askAIForFix(agent: AI, tool: ToolPlan, error: string, mode: "fix"
 ### 错误信息
 ${error}
 
+### 修复历史
+- 这是第 ${attempt} 次尝试（共 ${MAX_AUTO_ATTEMPTS} 次机会）
+${attempt > 1 ? "- 之前的修复方案失败了，需要尝试不同的思路" : ""}
+
 ### 当前环境
 - OS: ${osInfo.name} ${osInfo.version} (${osInfo.arch})
 - Shell: ${osInfo.shell}
 - 包管理器: ${OS.packageManagers().join(", ") || "无"}
 
-### 要求
-${modeInstruction}
+### 你的任务
+你是自动错误修复系统。**不需要用户确认**，你直接决定最佳修复方案。
+
+分析错误根因，选择最优策略：
+
+1. **action="commands"** — 你能确定错误原因，给出修复命令
+   - 修复命令解决前置问题（如依赖缺失、权限、brew 更新等）
+   - 修复后系统会自动重试原始安装命令
+   - 如果修复命令本身就包含了安装（如换了一种安装方式），设置 retry=false
+
+2. **action="alternative"** — 原方法不可行，换一种完全不同的方式
+   - 例如 brew 装不了就改用 curl 脚本、直接下载安装包等
+   - 提供 alternative.commands (完整安装命令)
+   - 如果是 .dmg/.pkg 安装包，用 alternative.download_url 直链
+
+3. **action="skip"** — 无法自动修复
+   - 需要用户手动操作（如注册账号、接受许可证、GUI 操作等）
+   - 在 explanation 里告诉用户该怎么做
+
+### 决策指南
+- 第 1 次优先尝试修复原方法（commands）
+- 如果之前已尝试过修复（attempt > 1），优先换方案（alternative）
+- 如果错误是 "stalled / no output"，说明进程卡死，应换一种方式
+- 如果涉及网络问题，可尝试换源或设代理
+- 如果涉及版本不存在，换可用版本或其他来源
+- **重要：如果安装工具（如 sdkman/nvm）成功但随后的使用命令失败，修复时要在 commands 中包含 source/init 命令**
 
 ### 输出格式
 返回**纯 JSON**（无 markdown 代码块）：
 
-当 action="commands"（修复命令）:
 {
-  "action": "commands",
-  "commands": ["修复命令1", "修复命令2"],
-  "explanation": "一句话说明修复原因和操作"
-}
-
-当 action="alternative"（替代方案）:
-{
-  "action": "alternative",
-  "explanation": "为什么推荐这个替代方案",
+  "action": "commands" | "alternative" | "skip",
+  "explanation": "中文，一句话说明诊断和方案",
+  "commands": ["仅 action=commands 时，修复命令列表"],
+  "retry": true,
   "alternative": {
-    "method": "新方法名(如 package_install, curl, manual_download)",
-    "commands": ["替代安装命令1", "命令2"],
-    "download_url": "如果是 package_install，填直链URL"
+    "method": "仅 action=alternative 时",
+    "commands": ["替代安装命令"],
+    "download_url": "可选，package_install 时填直链"
   }
-}
-
-当无法自动修复时:
-{
-  "action": "info",
-  "explanation": "问题的根本原因",
-  "info": "建议用户手动执行的步骤"
-}
-
-### 规则
-1. commands 必须可直接执行，适配 ${osInfo.platform} / ${osInfo.arch}
-2. 如果错误包含"Permission denied"，加 sudo
-3. 如果是 brew 问题，可能需要先 \`brew update\` 或 \`brew doctor\`
-4. 如果是网络问题，建议设置代理或换源
-5. 修复命令只解决前置问题，不要重复原始安装命令
-6. explanation 用中文`
+}`
 
   Log.prompt("askAIForFix", p)
   const response = await agent.chat(p)
@@ -1273,13 +1352,13 @@ ${modeInstruction}
 
   const jsonMatch = cleaned.match(/\{[\s\S]*\}/)
   if (!jsonMatch) {
-    return { action: "info", explanation: "AI 未能返回有效的修复方案", info: response.slice(0, 300) }
+    return { action: "skip", explanation: "AI 未能返回有效的修复方案" }
   }
 
   try {
     return JSON.parse(jsonMatch[0]) as FixAction
   } catch {
-    return { action: "info", explanation: "AI 返回了无法解析的内容", info: cleaned.slice(0, 300) }
+    return { action: "skip", explanation: "AI 返回了无法解析的内容" }
   }
 }
 
