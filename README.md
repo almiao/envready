@@ -1,3 +1,4 @@
+
 # envready
 
 > AI-powered software environment setup tool — 从"装环境"到"一句话搞定"
